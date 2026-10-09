@@ -1,5 +1,7 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 import asyncio
+import threading
+import uuid
 import os
 from ia_openai import analisar_com_openai
 from datetime import datetime, timezone
@@ -30,7 +32,7 @@ from learning_engine import (
 
 app = FastAPI(
     title="XAUUSD IA + NOTÍCIAS",
-    version="7.1"
+    version="7.2"
 )
 
 ULTIMO_SINAL = None
@@ -1868,7 +1870,7 @@ def inicio():
             "XAUUSD IA + NOTÍCIAS",
 
         "versao":
-            "7.1",
+            "7.2",
 
         "status":
             "ONLINE",
@@ -1907,189 +1909,109 @@ def noticias():
 # WEBHOOK
 # ============================================================
 
-@app.post("/webhook")
-async def webhook(
-    request: Request
-):
+# V7.2: o webhook confirma rapidamente; notícias/IA e learning rodam depois.
+# Limitação: tarefas em memória podem perder-se quando o Render reinicia.
+_ESTADO_LOCK = threading.Lock()
+_PROCESSAMENTO_LOCK = threading.Lock()
 
+
+def _noticias_indisponiveis():
+    return {"status": "PENDENTE", "impacto": "BAIXO", "direcao_ouro": "NEUTRA",
+            "confianca": "BAIXA", "quantidade": 0, "noticias": []}
+
+
+def _processar_em_segundo_plano(identificador, data, tecnico):
     global ULTIMO_SINAL
-
+    # Evita acumular chamadas lentas quando chegam vários candles M5.
+    if not _PROCESSAMENTO_LOCK.acquire(blocking=False):
+        with _ESTADO_LOCK:
+            if ULTIMO_SINAL and ULTIMO_SINAL.get("id") == identificador:
+                ULTIMO_SINAL["processamento"] = "IGNORADO_OCUPADO"
+                ULTIMO_SINAL["ia"] = {"status": "NAO_EXECUTADA", "decisao": "AGUARDAR"}
+        return
     try:
+        try:
+            noticias = analisar_noticias()
+        except Exception as exc:
+            print("Erro ao consultar noticias:", type(exc).__name__, flush=True)
+            noticias = _noticias_indisponiveis()
+            noticias["status"] = "ERRO"
+        decisao = decisao_provisoria(tecnico, noticias)
+        sinal = str(data.get("sinal", "")).upper()
+        # Observações M5 alimentam a análise técnica, sem cobrar GPT a cada 5 minutos.
+        if sinal in ("BUY", "SELL") and tecnico.get("status") in ("BUY", "SELL"):
+            try:
+                ia = analisar_com_openai(tecnico, noticias, decisao)
+            except Exception as exc:
+                ia = {"status": "ERRO", "decisao": "AGUARDAR", "confianca": 0,
+                      "tipo_erro": type(exc).__name__}
+        else:
+            ia = {"status": "NAO_EXECUTADA", "decisao": "AGUARDAR",
+                  "justificacao": "Observação M5 sem sinal técnico confirmado; IA poupada."}
+        try:
+            resultados = acompanhar_observacoes_automaticamente(data)
+            novas = observar_conhecimentos_automaticamente(data, tecnico, noticias, decisao)
+            aprendizagem = {"resultados_observacoes": resultados, "novas_observacoes": novas}
+        except Exception as exc:
+            print("Erro no learning:", type(exc).__name__, flush=True)
+            aprendizagem = {"erro": type(exc).__name__}
+        with _ESTADO_LOCK:
+            # Não sobrescreve o último candle com resultado atrasado de candle antigo.
+            if ULTIMO_SINAL and ULTIMO_SINAL.get("id") == identificador:
+                ULTIMO_SINAL.update({"analise_noticias": noticias,
+                                     "decisao_provisoria": decisao,
+                                     "ia": ia, "decisao_final": decisao,
+                                     "aprendizagem_v7": aprendizagem,
+                                     "processamento": "CONCLUIDO"})
+        print("V7.2 processamento concluido:", identificador, ia.get("status"), flush=True)
+    except Exception as exc:
+        print("V7.2 erro inesperado:", type(exc).__name__, str(exc), flush=True)
+        with _ESTADO_LOCK:
+            if ULTIMO_SINAL and ULTIMO_SINAL.get("id") == identificador:
+                ULTIMO_SINAL["processamento"] = "ERRO"
+    finally:
+        _PROCESSAMENTO_LOCK.release()
 
+
+@app.post("/webhook")
+async def webhook(request: Request, background_tasks: BackgroundTasks):
+    global ULTIMO_SINAL
+    try:
         data = await request.json()
-
-        # Compatibilidade com o JSON atual do TradingView
+        if not isinstance(data, dict):
+            return {"ok": False, "erro": "JSON deve ser um objeto"}
         if "stop_loss" not in data and "sl" in data:
             data["stop_loss"] = data["sl"]
         if "candles" not in data and "candles_m5" in data:
             data["candles"] = data["candles_m5"]
-
     except Exception:
-
-        return {
-            "ok": False,
-            "erro": "JSON inválido"
-        }
-
-    faltando = validar_sinal(
-        data
-    )
-
+        return {"ok": False, "erro": "JSON inválido"}
+    faltando = validar_sinal(data)
     if faltando:
-
-        return {
-
-            "ok": False,
-
-            "erro":
-                "Campos obrigatórios ausentes",
-
-            "campos":
-                faltando
-        }
-
-    tecnico = analisar_tecnico(
-        data
-    )
-
-    noticias = analisar_noticias()
-
-    decisao = decisao_provisoria(
-        tecnico,
-        noticias
-    )
-
-    # V7.1: análise consultiva externa, sem alterar a decisão operacional.
-    # Executada numa thread para não bloquear o loop do FastAPI.
+        return {"ok": False, "erro": "Campos obrigatórios ausentes", "campos": faltando}
     try:
-        ia_resultado = await asyncio.to_thread(
-            analisar_com_openai, tecnico, noticias, decisao
-        )
-    except Exception:
-        ia_resultado = {
-            "status": "ERRO",
-            "decisao": "AGUARDAR",
-            "confianca": 0,
-            "justificacao": "IA externa indisponível; decisão técnica preservada.",
-            "riscos": ["Falha na consulta à IA externa"],
+        tecnico = analisar_tecnico(data)
+    except Exception as exc:
+        return {"ok": False, "erro": "Falha na análise técnica", "tipo": type(exc).__name__}
+    identificador = uuid.uuid4().hex
+    recebido = agora()
+    with _ESTADO_LOCK:
+        ULTIMO_SINAL = {
+            "id": identificador, "recebido_em": recebido, "dados": data,
+            "analise_tecnica": tecnico, "analise_noticias": _noticias_indisponiveis(),
+            "decisao_provisoria": "AGUARDAR",
+            "ia": {"status": "PENDENTE", "decisao": "AGUARDAR"},
+            "decisao_final": "AGUARDAR", "aprendizagem_v7": {},
+            "processamento": "PENDENTE"
         }
-
-    # Primeiro resolve observações antigas usando o novo candle recebido.
-    # Depois cria uma nova observação, se uma hipótese aparecer agora.
-    resultados_observacoes_v7 = acompanhar_observacoes_automaticamente(data)
-
-    observacoes_v7 = observar_conhecimentos_automaticamente(
-        data,
-        tecnico,
-        noticias,
-        decisao
-    )
-
-    ULTIMO_SINAL = {
-
-        "recebido_em":
-            agora(),
-
-        "dados":
-            data,
-
-        "analise_tecnica":
-            tecnico,
-
-        "analise_noticias":
-            noticias,
-
-        "decisao_provisoria":
-            decisao,
-
-        "ia": ia_resultado,
-
-        "decisao_final": decisao,
-
-        "aprendizagem_v7": {
-            "resultados_observacoes": resultados_observacoes_v7,
-            "novas_observacoes": observacoes_v7,
-        }
-    }
-
-    resposta = {
-
-        "ok":
-            True,
-
-        "sistema":
-            "XAUUSD IA + NOTÍCIAS",
-
-        "versao":
-            "7.1",
-
-        "recebido_em":
-            agora(),
-
-        "ativo":
-            data["ativo"],
-
-        "timeframe":
-            data[
-                "timeframe_operacao"
-            ],
-
-        "sinal":
-            data["sinal"],
-
-        "score_tecnico":
-            data[
-                "score_tecnico"
-            ],
-
-        "analise_tecnica":
-            tecnico,
-
-        "noticias":
-            noticias,
-
-        "ia": ia_resultado,
-
-        "decisao_final":
-            decisao,
-
-        "aprendizagem_v7": {
-            "resultados_observacoes": resultados_observacoes_v7,
-            "novas_observacoes": observacoes_v7,
-            "nota": (
-                "EM_OBSERVACAO registra detecção da hipótese; "
-                "não significa que ela foi validada."
-            )
-        }
-    }
-
-    print(
-        "\n"
-        +
-        "=" * 70
-    )
-
-    print(
-        "NOVO SINAL XAUUSD"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        json.dumps(
-            resposta,
-            indent=2,
-            ensure_ascii=False
-        )
-    )
-
-    print(
-        "=" * 70
-    )
-
-    return resposta
+    background_tasks.add_task(_processar_em_segundo_plano, identificador, data, tecnico)
+    return {"ok": True, "sistema": "XAUUSD IA + NOTÍCIAS", "versao": "7.2",
+            "id": identificador, "recebido_em": recebido,
+            "ativo": data["ativo"], "timeframe": data["timeframe_operacao"],
+            "sinal": data["sinal"], "score_tecnico": data["score_tecnico"],
+            "analise_tecnica": tecnico, "decisao_final": "AGUARDAR",
+            "processamento": "PENDENTE",
+            "nota": "Recebido. Análise de notícias e IA executadas depois da resposta."}
 
 
 # ============================================================
@@ -2131,7 +2053,7 @@ def v7_learning():
     return {
         "ok": True,
         "sistema": "XAUUSD IA + NOTÍCIAS",
-        "versao": "7.1",
+        "versao": "7.2",
         "hora": agora(),
         "learning": resumo_learning()
     }
@@ -2294,7 +2216,7 @@ def v7_status():
     return {
         "ok": True,
         "sistema": "XAUUSD IA + NOTÍCIAS",
-        "versao": "7.1",
+        "versao": "7.2",
         "hora": agora(),
         "motor_tecnico": "ONLINE",
         "motor_noticias": "ONLINE",
