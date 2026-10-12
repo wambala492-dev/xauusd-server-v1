@@ -16,6 +16,7 @@ import xml.etree.ElementTree as ET
 from learning_engine import (
     init_learning_db,
     criar_conhecimento,
+    obter_ou_criar_conhecimento,
     obter_conhecimento,
     listar_conhecimentos,
     registrar_observacao,
@@ -32,7 +33,7 @@ from learning_engine import (
 
 app = FastAPI(
     title="XAUUSD IA + NOTÍCIAS",
-    version="7.2"
+    version="7.3.1"
 )
 
 ULTIMO_SINAL = None
@@ -52,11 +53,48 @@ def observar_conhecimentos_automaticamente(data, tecnico, noticias, decisao):
     """
     observacoes = []
 
+    # Sem candle identificável não há deduplicação segura nem avaliação temporal.
+    if data.get("timestamp") is None:
+        return observacoes
+    try:
+        if float(data["timestamp"]) <= 0:
+            return observacoes
+    except (ValueError, TypeError):
+        return observacoes
+
+    # Só aprende sinais confirmados com níveis numéricos coerentes.
+    sinal_entrada = str(data.get("sinal", "")).upper()
+    if sinal_entrada not in ("BUY", "SELL") or tecnico.get("status") != sinal_entrada or decisao != sinal_entrada:
+        return observacoes
+    try:
+        entrada = float(data.get("entrada"))
+        sl = float(data.get("stop_loss", data.get("sl")))
+        tp1 = float(data.get("tp1"))
+        if not (entrada > 0 and sl > 0 and tp1 > 0):
+            return observacoes
+        if sinal_entrada == "BUY" and not (sl < entrada < tp1):
+            return observacoes
+        if sinal_entrada == "SELL" and not (tp1 < entrada < sl):
+            return observacoes
+    except (TypeError, ValueError):
+        return observacoes
+
     ativo = str(data.get("ativo", "")).upper()
     timeframe = str(data.get("timeframe_operacao", "")).upper()
     sinal = str(data.get("sinal", "")).upper()
     compras = int(data.get("compras_alinhadas", 0) or 0)
     vendas = int(data.get("vendas_alinhadas", 0) or 0)
+
+    # Cria hipótese por direção e alinhamento, nunca uma hipótese por candle.
+    # Uma ocorrência permanece pendente até ser resolvida.
+    if ativo == "XAUUSD" and timeframe in ("M5", "5"):
+        condicoes = {"ativo": ativo, "timeframe_operacao": timeframe, "direcao": sinal}
+        obter_ou_criar_conhecimento(
+            titulo=f"Setup XAUUSD {sinal} confirmado M5",
+            regra=f"setup_confirmado_{sinal.lower()}_m5",
+            fonte="webhook_tradingview_v7_3",
+            condicoes=condicoes,
+        )
 
     for conhecimento in listar_conhecimentos():
         try:
@@ -79,6 +117,8 @@ def observar_conhecimentos_automaticamente(data, tecnico, noticias, decisao):
 
         if timeframe_condicao != timeframe:
             continue
+        if str(condicoes.get("direcao", sinal)).upper() != sinal:
+            continue
 
         regra = str(
             conhecimento.get("regra", "")
@@ -96,6 +136,9 @@ def observar_conhecimentos_automaticamente(data, tecnico, noticias, decisao):
 
         contexto = {
             "sinal": sinal,
+            "identificador_sinal": data.get("id_sinal") or data.get("timestamp"),
+            "timestamp_sinal": data.get("timestamp"),
+            "candle_close_time_sinal": data.get("candle_close_time"),
             "score_tecnico": data.get("score_tecnico"),
             "compras_alinhadas": compras,
             "vendas_alinhadas": vendas,
@@ -106,6 +149,7 @@ def observar_conhecimentos_automaticamente(data, tecnico, noticias, decisao):
             "tp2": data.get("tp2"),
             "tp3": data.get("tp3"),
             "decisao_v7": decisao,
+            "criado_no_webhook_em": agora(),
             "price_action": tecnico.get("price_action", {}),
             "noticias": {
                 "direcao_ouro": noticias.get("direcao_ouro"),
@@ -155,6 +199,7 @@ def observar_conhecimentos_automaticamente(data, tecnico, noticias, decisao):
                 "confianca": atualizado.get("confianca"),
                 "observation_id": atualizado.get("observation_id"),
                 "ja_pendente": False,
+                "observacao_duplicada": atualizado.get("observacao_duplicada", False),
             })
         except Exception as exc:
             observacoes.append({
@@ -165,67 +210,116 @@ def observar_conhecimentos_automaticamente(data, tecnico, noticias, decisao):
     return observacoes
 
 
+def _timestamp_ms(valor):
+    """Aceita timestamps Unix em segundos ou milissegundos; rejeita IDs textuais."""
+    import math
+    try:
+        numero = float(valor)
+        if not math.isfinite(numero) or numero <= 0:
+            return None
+        if 1_000_000_000 <= numero < 10_000_000_000:
+            return int(numero * 1000)
+        if 1_000_000_000_000 <= numero < 10_000_000_000_000:
+            return int(numero)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return None
+
+
+def _intervalo_ultima_vela(data, candle):
+    """Intervalo M5 verificável da última vela; nunca deduz a hora de candles antigos."""
+    abertura = _timestamp_ms(candle.get("timestamp"))
+    fechamento = _timestamp_ms(candle.get("candle_close_time"))
+    if abertura is None:
+        abertura = _timestamp_ms(data.get("timestamp"))
+    if fechamento is None:
+        fechamento = _timestamp_ms(data.get("candle_close_time"))
+    if abertura is None or fechamento is None:
+        return None
+    if fechamento - abertura != 300_000:
+        return None
+    return abertura, fechamento
+
+
 def acompanhar_observacoes_automaticamente(data):
     """
-    Avalia observacoes pendentes usando o candle atual recebido pelo webhook.
-
-    Regras conservadoras:
-    - BUY: TP1/TP2/TP3 atingido => RESPEITOU; SL atingido => FALHOU.
-    - SELL: TP1/TP2/TP3 atingido => RESPEITOU; SL atingido => FALHOU.
-    - Se SL e TP forem tocados no mesmo candle, a ordem intrabar nao pode
-      ser conhecida pelo OHLC; registra INCONCLUSIVO.
+    Resolve observações somente com a última vela M5 fechada e temporalmente
+    posterior à vela que originou o sinal. Sem provas temporais, não resolve.
     """
     resultados = []
+    if str(data.get("timeframe_operacao", "")).upper() not in ("M5", "5"):
+        return resultados
+
     candles = normalizar_candles(data)
     if not candles:
         return resultados
 
     atual = candles[-1]
-    high = float(atual.get("high"))
-    low = float(atual.get("low"))
+    intervalo = _intervalo_ultima_vela(data, atual)
+    if intervalo is None:
+        return resultados
+    abertura_atual, fechamento_atual = intervalo
+
+    # Exige confirmação explícita de que o candle terminou.
+    # A hora de fecho do candle não prova por si só que já fechou.
+    recebido_em = _timestamp_ms(data.get("timestamp_recebimento"))
+    if recebido_em is None or recebido_em < fechamento_atual:
+        return resultados
+
+    high = float(atual["high"])
+    low = float(atual["low"])
 
     for obs in listar_observacoes_pendentes():
-        try:
-            contexto = json.loads(obs.get("contexto") or "{}")
-        except Exception:
-            contexto = {}
-
-        try:
-            entrada = float(contexto.get("entrada"))
-            sl = float(contexto.get("stop_loss"))
-            tps = [float(contexto[k]) for k in ("tp1", "tp2", "tp3") if contexto.get(k) is not None]
-        except (TypeError, ValueError):
-            resultados.append({
-                "observation_id": obs.get("id"),
-                "status": "AGUARDANDO_DADOS",
-                "detalhe": "Entrada, SL ou TP inválido na observação."
-            })
+        if str(obs.get("ativo", "")).upper() != str(data.get("ativo", "")).upper():
+            continue
+        if str(obs.get("timeframe", "")).upper() not in ("M5", "5"):
             continue
 
-        sinal = str(contexto.get("sinal", "")).upper()
-        if sinal not in ("BUY", "SELL") or not tps:
-            resultados.append({
-                "observation_id": obs.get("id"),
-                "status": "AGUARDANDO_DADOS",
-                "detalhe": "Direção ou níveis insuficientes para resolver a observação."
-            })
+        try:
+            contexto_bruto = obs.get("contexto") or "{}"
+            contexto = json.loads(contexto_bruto) if isinstance(contexto_bruto, str) else contexto_bruto
+            if not isinstance(contexto, dict):
+                continue
+        except (TypeError, ValueError):
+            continue
+
+        inicio = _timestamp_ms(contexto.get("timestamp_sinal"))
+        fim_sinal = _timestamp_ms(contexto.get("candle_close_time_sinal"))
+        if inicio is None:
+            continue
+        if fim_sinal is None:
+            fim_sinal = inicio + 300_000
+        if fim_sinal - inicio != 300_000:
+            continue
+        if abertura_atual < fim_sinal:
+            continue
+
+        try:
+            entrada = float(contexto["entrada"])
+            sl = float(contexto["stop_loss"])
+            tp1 = float(contexto["tp1"])
+            sinal = str(contexto.get("sinal", "")).upper()
+            if sinal == "BUY" and not (0 < sl < entrada < tp1):
+                continue
+            if sinal == "SELL" and not (0 < tp1 < entrada < sl):
+                continue
+            if sinal not in ("BUY", "SELL"):
+                continue
+        except (KeyError, TypeError, ValueError):
             continue
 
         atingiu_sl = low <= sl if sinal == "BUY" else high >= sl
-        atingiu_tp = high >= min(tps) if sinal == "BUY" else low <= max(tps)
+        atingiu_tp = high >= tp1 if sinal == "BUY" else low <= tp1
 
         if atingiu_sl and atingiu_tp:
             resultado = "INCONCLUSIVO"
-            detalhe = (
-                "O mesmo candle tocou SL e TP; a ordem intrabar não pode ser "
-                "determinada com segurança apenas pelos dados OHLC."
-            )
+            detalhe = "SL e TP1 tocados na mesma vela M5; ordem intrabar desconhecida."
         elif atingiu_tp:
             resultado = "RESPEITOU"
-            detalhe = "TP atingido no mercado recebido pelo webhook."
+            detalhe = "TP1 atingido em vela M5 posterior ao fecho da vela do sinal."
         elif atingiu_sl:
             resultado = "FALHOU"
-            detalhe = "SL atingido no mercado recebido pelo webhook."
+            detalhe = "SL atingido em vela M5 posterior ao fecho da vela do sinal."
         else:
             resultados.append({
                 "observation_id": obs.get("id"),
@@ -234,7 +328,7 @@ def acompanhar_observacoes_automaticamente(data):
                 "resultado": "EM_OBSERVACAO",
                 "entrada": entrada,
                 "stop_loss": sl,
-                "tp1": tps[0],
+                "tp1": tp1,
                 "preco_high": high,
                 "preco_low": low,
             })
@@ -242,9 +336,7 @@ def acompanhar_observacoes_automaticamente(data):
 
         try:
             conhecimento = resolver_observacao(
-                observation_id=str(obs["id"]),
-                resultado=resultado,
-                detalhe=detalhe,
+                observation_id=str(obs["id"]), resultado=resultado, detalhe=detalhe
             )
             resultados.append({
                 "observation_id": obs.get("id"),
@@ -255,9 +347,7 @@ def acompanhar_observacoes_automaticamente(data):
             })
         except ValueError as exc:
             resultados.append({
-                "observation_id": obs.get("id"),
-                "status": "ERRO",
-                "erro": str(exc),
+                "observation_id": obs.get("id"), "status": "ERRO", "erro": str(exc)
             })
 
     return resultados
@@ -1738,17 +1828,30 @@ def _numero(valor, padrao=0.0):
 
 def normalizar_candles(data):
     bruto = data.get("candles", data.get("ohlc", []))
-    if not isinstance(bruto, list): return []
-    candles=[]
+    if not isinstance(bruto, list):
+        return []
+    candles = []
     for c in bruto[-100:]:
-        if not isinstance(c, dict): continue
+        if not isinstance(c, dict):
+            continue
         o = _numero(c.get("open", c.get("o")))
         h = _numero(c.get("high", c.get("h")))
         l = _numero(c.get("low", c.get("l")))
         cl = _numero(c.get("close", c.get("c")))
-        if h<=0 or l<=0 or h<l or cl<=0: continue
-        if o<=0: o=cl
-        candles.append({"open":o,"high":h,"low":l,"close":cl})
+        if h <= 0 or l <= 0 or h < l or cl <= 0 or o < 0:
+            continue
+        if o <= 0:
+            o = cl
+        candle = {"open": o, "high": h, "low": l, "close": cl}
+        for campo, aliases in {
+            "timestamp": ("timestamp", "time", "t"),
+            "candle_close_time": ("candle_close_time", "time_close", "T"),
+        }.items():
+            for alias in aliases:
+                if c.get(alias) is not None:
+                    candle[campo] = c[alias]
+                    break
+        candles.append(candle)
     return candles
 
 def anatomia_candle(c):
@@ -1870,7 +1973,7 @@ def inicio():
             "XAUUSD IA + NOTÍCIAS",
 
         "versao":
-            "7.2",
+            "7.3",
 
         "status":
             "ONLINE",
@@ -1909,7 +2012,7 @@ def noticias():
 # WEBHOOK
 # ============================================================
 
-# V7.2: o webhook confirma rapidamente; notícias/IA e learning rodam depois.
+# V7.3: o webhook confirma rapidamente; notícias/IA e learning rodam depois.
 # Limitação: tarefas em memória podem perder-se quando o Render reinicia.
 _ESTADO_LOCK = threading.Lock()
 _PROCESSAMENTO_LOCK = threading.Lock()
@@ -1963,9 +2066,9 @@ def _processar_em_segundo_plano(identificador, data, tecnico):
                                      "ia": ia, "decisao_final": decisao,
                                      "aprendizagem_v7": aprendizagem,
                                      "processamento": "CONCLUIDO"})
-        print("V7.2 processamento concluido:", identificador, ia.get("status"), flush=True)
+        print("V7.3 processamento concluido:", identificador, ia.get("status"), flush=True)
     except Exception as exc:
-        print("V7.2 erro inesperado:", type(exc).__name__, str(exc), flush=True)
+        print("V7.3 erro inesperado:", type(exc).__name__, str(exc), flush=True)
         with _ESTADO_LOCK:
             if ULTIMO_SINAL and ULTIMO_SINAL.get("id") == identificador:
                 ULTIMO_SINAL["processamento"] = "ERRO"
@@ -2005,7 +2108,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             "processamento": "PENDENTE"
         }
     background_tasks.add_task(_processar_em_segundo_plano, identificador, data, tecnico)
-    return {"ok": True, "sistema": "XAUUSD IA + NOTÍCIAS", "versao": "7.2",
+    return {"ok": True, "sistema": "XAUUSD IA + NOTÍCIAS", "versao": "7.3.1",
             "id": identificador, "recebido_em": recebido,
             "ativo": data["ativo"], "timeframe": data["timeframe_operacao"],
             "sinal": data["sinal"], "score_tecnico": data["score_tecnico"],
@@ -2047,13 +2150,20 @@ def ultimo_sinal():
 # V7 — LEARNING ENGINE / MEMÓRIA
 # ============================================================
 
+def _autorizado_admin(request: Request) -> bool:
+    import secrets
+    token = os.getenv("LEARNING_ADMIN_TOKEN", "")
+    fornecido = request.headers.get("X-Admin-Token", "")
+    return bool(token and fornecido and secrets.compare_digest(token, fornecido))
+
+
 @app.get("/v7/learning")
 def v7_learning():
     """Resumo da memória e do estado de aprendizagem V7."""
     return {
         "ok": True,
         "sistema": "XAUUSD IA + NOTÍCIAS",
-        "versao": "7.2",
+        "versao": "7.3.1",
         "hora": agora(),
         "learning": resumo_learning()
     }
@@ -2072,6 +2182,8 @@ def v7_listar_conhecimentos():
 @app.post("/v7/knowledge")
 async def v7_criar_conhecimento(request: Request):
     """Registra uma nova hipótese/conhecimento para posterior validação."""
+    if not _autorizado_admin(request):
+        return {"ok": False, "erro": "Não autorizado"}
     try:
         data = await request.json()
     except Exception:
@@ -2136,6 +2248,8 @@ def v7_observacoes_pendentes(knowledge_id: str | None = None):
 @app.post("/v7/observation/resolve")
 async def v7_resolver_observacao(request: Request):
     """Fecha uma observação pendente com o resultado real, sem dupla contagem."""
+    if not _autorizado_admin(request):
+        return {"ok": False, "erro": "Não autorizado"}
     try:
         data = await request.json()
     except Exception:
@@ -2162,6 +2276,8 @@ async def v7_resolver_observacao(request: Request):
 @app.post("/v7/observation")
 async def v7_registrar_observacao(request: Request):
     """Registra o resultado real de uma hipótese/padrão observado."""
+    if not _autorizado_admin(request):
+        return {"ok": False, "erro": "Não autorizado"}
     try:
         data = await request.json()
     except Exception:
@@ -2216,11 +2332,12 @@ def v7_status():
     return {
         "ok": True,
         "sistema": "XAUUSD IA + NOTÍCIAS",
-        "versao": "7.2",
+        "versao": "7.3.1",
         "hora": agora(),
         "motor_tecnico": "ONLINE",
         "motor_noticias": "ONLINE",
         "learning_engine": "ONLINE",
+        "memoria_backend": "POSTGRESQL" if os.getenv("DATABASE_URL") else "SQLITE",
         "ia_externa": "CONFIGURADA" if os.getenv("OPENAI_API_KEY") else "SEM_CHAVE",
         "memoria": learning,
         "ultimo_sinal_recebido": ULTIMO_SINAL is not None

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import os
+from contextlib import contextmanager
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,10 +16,35 @@ def agora() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class _PGConnection:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def execute(self, sql, params=()):
+        return self.conn.execute(sql.replace("?", "%s"), params)
+
+    def executescript(self, script):
+        for statement in script.split(";"):
+            if statement.strip():
+                self.conn.execute(statement)
+
+
+@contextmanager
 def _db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if url:
+        import psycopg
+        from psycopg.rows import dict_row
+        with psycopg.connect(url, row_factory=dict_row, connect_timeout=10) as conn:
+            yield _PGConnection(conn)
+    else:
+        conn = sqlite3.connect(DB_PATH, timeout=15)
+        conn.row_factory = sqlite3.Row
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
 
 def init_learning_db() -> None:
@@ -171,6 +198,15 @@ def listar_observacoes_pendentes(knowledge_id: Optional[str] = None) -> list[Dic
     return [dict(r) for r in rows]
 
 
+def _id_observacao(knowledge_id: str, ativo: str, timeframe: str, contexto: Dict[str, Any]) -> str:
+    """Identificador permanente para uma ocorrência com ID explícito do sinal."""
+    identificador = contexto.get("identificador_sinal")
+    if identificador is None or isinstance(identificador, bool) or not str(identificador).strip():
+        raise ValueError("identificador_sinal obrigatório para evitar duplicações")
+    chave = json.dumps([str(knowledge_id), str(ativo).upper(), str(timeframe).upper(), str(identificador)], ensure_ascii=False, separators=(",", ":"))
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "xauusd:v7.3.1:" + chave))
+
+
 def registrar_observacao(
     knowledge_id: str,
     ativo: str,
@@ -195,21 +231,28 @@ def registrar_observacao(
         if not k:
             raise ValueError("knowledge_id inexistente")
 
-        # Detecção pendente: não conta como amostra avaliada.
+        # Identidade determinística, com conflito tratado atomicamente pela chave primária.
+        # O mesmo sinal não volta a ser contado mesmo após a resolução.
+        obs_id = _id_observacao(knowledge_id, ativo, timeframe, contexto)
         if resultado == "EM_OBSERVACAO":
-            obs_id = str(uuid.uuid4())
             db.execute(
-                "INSERT INTO observations (id,knowledge_id,ativo,timeframe,detectado_em,contexto,resultado,detalhe) VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO observations (id,knowledge_id,ativo,timeframe,detectado_em,contexto,resultado,detalhe) "
+                "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING",
                 (obs_id, knowledge_id, ativo, timeframe, agora(), json.dumps(contexto, ensure_ascii=False), resultado, detalhe),
             )
-            return dict(db.execute("SELECT * FROM knowledge WHERE id=?", (knowledge_id,)).fetchone())
+            saida = dict(db.execute("SELECT * FROM knowledge WHERE id=?", (knowledge_id,)).fetchone())
+            saida["observation_id"] = obs_id
+            saida["observacao_duplicada"] = str(db.execute("SELECT resultado FROM observations WHERE id=?", (obs_id,)).fetchone()["resultado"]).upper() != "EM_OBSERVACAO"
+            return saida
 
-        # Para resultados finais, manter esta função compatível para uso manual.
-        obs_id = str(uuid.uuid4())
-        db.execute(
-            "INSERT INTO observations (id,knowledge_id,ativo,timeframe,detectado_em,contexto,resultado,detalhe) VALUES (?,?,?,?,?,?,?,?)",
+        # Resultados manuais com o mesmo identificador não podem duplicar amostras.
+        inserido = db.execute(
+            "INSERT INTO observations (id,knowledge_id,ativo,timeframe,detectado_em,contexto,resultado,detalhe) "
+            "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING",
             (obs_id, knowledge_id, ativo, timeframe, agora(), json.dumps(contexto, ensure_ascii=False), resultado, detalhe),
         )
+        if inserido.rowcount == 0:
+            raise ValueError("sinal já registado; use resolver_observacao para uma observação pendente")
 
         amostras = int(k["amostras"]) + (0 if resultado == "INCONCLUSIVO" else 1)
         respeitou = int(k["respeitou"]) + (1 if resultado == "RESPEITOU" else 0)
@@ -233,7 +276,7 @@ def resolver_observacao(observation_id: str, resultado: str, detalhe: str = "") 
         raise ValueError("resultado deve ser RESPEITOU, FALHOU ou INCONCLUSIVO")
 
     with _db() as db:
-        obs = db.execute("SELECT * FROM observations WHERE id=?", (observation_id,)).fetchone()
+        obs = db.execute("SELECT * FROM observations WHERE id=?" + (" FOR UPDATE" if os.environ.get("DATABASE_URL", "").strip() else ""), (observation_id,)).fetchone()
         if not obs:
             raise ValueError("observation_id inexistente")
         if str(obs["resultado"]).upper() != "EM_OBSERVACAO":
@@ -244,7 +287,7 @@ def resolver_observacao(observation_id: str, resultado: str, detalhe: str = "") 
             raise ValueError("knowledge_id inexistente")
 
         db.execute(
-            "UPDATE observations SET resultado=?, detalhe=? WHERE id=?",
+            "UPDATE observations SET resultado=?, detalhe=? WHERE id=? AND resultado='EM_OBSERVACAO'",
             (resultado, detalhe, observation_id),
         )
 
@@ -274,6 +317,20 @@ def resumo() -> Dict[str, Any]:
         "rejeitadas": sum(x["status"] == "REJEITADA" for x in conhecimentos),
     }
 
+
+
+def obter_ou_criar_conhecimento(titulo: str, regra: str, fonte: str, condicoes: Dict[str, Any]) -> Dict[str, Any]:
+    """Obtém hipótese idêntica ou cria uma; serialização estável evita duplicados."""
+    init_learning_db()
+    cond = json.dumps(condicoes, ensure_ascii=False, sort_keys=True)
+    with _db() as db:
+        row = db.execute("SELECT * FROM knowledge WHERE regra=? AND condicoes=? ORDER BY criado_em LIMIT 1", (regra, cond)).fetchone()
+        if row:
+            return dict(row)
+        kid = str(uuid.uuid4())
+        now = agora()
+        db.execute("INSERT INTO knowledge (id,titulo,fonte,regra,condicoes,criado_em,atualizado_em) VALUES (?,?,?,?,?,?,?)", (kid, titulo, fonte, regra, cond, now, now))
+        return dict(db.execute("SELECT * FROM knowledge WHERE id=?", (kid,)).fetchone())
 
 init_learning_db()
 
